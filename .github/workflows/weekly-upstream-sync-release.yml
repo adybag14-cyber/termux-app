@@ -1,0 +1,154 @@
+name: Weekly upstream sync and signed release
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-termux-release
+  cancel-in-progress: false
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with upstream termux/termux-app master
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/termux/termux-app.git || true
+          git fetch upstream master
+          BEFORE_SHA="$(git rev-parse HEAD)"
+          git merge --no-edit --no-ff "upstream/master" -m "sync: merge upstream termux/termux-app master"
+          AFTER_SHA="$(git rev-parse HEAD)"
+          if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+            git push origin HEAD:master
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already up to date with upstream."
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "upstream_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Apply F-Droid prebuild patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          for module in terminal-emulator terminal-view termux-shared; do
+            sed -i '/publishing {/,/^    }/d' "$module/build.gradle"
+          done
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build universal release APK
+        shell: bash
+        env:
+          TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS: '0'
+          TERMUX_PACKAGE_VARIANT: apt-android-7
+        run: |
+          set -euo pipefail
+          ./gradlew :app:downloadBootstraps :app:assembleRelease --no-daemon
+
+      - name: Decode signing keystore
+        shell: bash
+        env:
+          TERMUX_KEYSTORE_BASE64: ${{ secrets.TERMUX_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TERMUX_KEYSTORE_BASE64:-}" ]; then
+            echo "TERMUX_KEYSTORE_BASE64 secret is not configured."
+            exit 1
+          fi
+          echo "$TERMUX_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/termux-release.keystore"
+
+      - name: Sign release APK
+        id: sign
+        shell: bash
+        env:
+          TERMUX_KEYSTORE_PASSWORD: ${{ secrets.TERMUX_KEYSTORE_PASSWORD }}
+          TERMUX_KEY_ALIAS: ${{ secrets.TERMUX_KEY_ALIAS }}
+          TERMUX_KEY_PASSWORD: ${{ secrets.TERMUX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          UNSIGNED_APK="./app/build/outputs/apk/release/termux-app_apt-android-7-release_universal.apk"
+          SIGNED_APK="$RUNNER_TEMP/termux-app_apt-android-7-release_universal-signed.apk"
+          if [ ! -f "$UNSIGNED_APK" ]; then
+            echo "Release APK not found at $UNSIGNED_APK"
+            ls -la ./app/build/outputs/apk/release || true
+            exit 1
+          fi
+          SEARCH_ROOTS=("$HOME/.android/sdk" "$HOME/Android/Sdk")
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            SEARCH_ROOTS+=("$ANDROID_HOME")
+          fi
+          if [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+            SEARCH_ROOTS+=("$ANDROID_SDK_ROOT")
+          fi
+          BUILD_TOOLS=""
+          for root in "${SEARCH_ROOTS[@]}"; do
+            if [ -d "$root" ]; then
+              candidate="$(find "$root" -path '*/build-tools/*/apksigner' 2>/dev/null | sort -V | tail -n 1 || true)"
+              if [ -n "$candidate" ]; then
+                BUILD_TOOLS="$candidate"
+                break
+              fi
+            fi
+          done
+          if [ -z "$BUILD_TOOLS" ]; then
+            echo "apksigner not found after Gradle build."
+            exit 1
+          fi
+          cp "$UNSIGNED_APK" "$SIGNED_APK"
+          "$BUILD_TOOLS" sign \
+            --ks "$RUNNER_TEMP/termux-release.keystore" \
+            --ks-key-alias "$TERMUX_KEY_ALIAS" \
+            --ks-pass "pass:$TERMUX_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$TERMUX_KEY_PASSWORD" \
+            --out "$SIGNED_APK" \
+            "$UNSIGNED_APK"
+          "$BUILD_TOOLS" verify --verbose "$SIGNED_APK"
+          VERSION_NAME="$(grep -m1 'versionName "' ./app/build.gradle | sed -E 's/.*versionName "([^"]+)".*/\1/')"
+          RELEASE_TAG="weekly-${VERSION_NAME}-$(date -u +%Y%m%d)-${{ steps.sync.outputs.upstream_sha }}"
+          RELEASE_TAG="${RELEASE_TAG:0:120}"
+          echo "signed_apk=$SIGNED_APK" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.sign.outputs.release_tag }}
+          path: ${{ steps.sign.outputs.signed_apk }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sign.outputs.release_tag }}
+          name: Termux weekly build ${{ steps.sign.outputs.version_name }}
+          body: |
+            Automated weekly build from [termux/termux-app](https://github.com/termux/termux-app) `master`.
+
+            - Upstream commit: `${{ steps.sync.outputs.upstream_sha }}`
+            - Variant: `apt-android-7` universal release
+            - Upstream sync applied: `${{ steps.sync.outputs.synced }}`
+          files: ${{ steps.sign.outputs.signed_apk }}
+          prerelease: true
