@@ -14,7 +14,14 @@ concurrency:
 
 jobs:
   sync-and-build:
+    name: Sync upstream and build signed APK
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.sign.outputs.release_tag }}
+      version_name: ${{ steps.sign.outputs.version_name }}
+      release_commit: ${{ steps.sync.outputs.release_commit }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      synced: ${{ steps.sync.outputs.synced }}
 
     steps:
       - name: Checkout fork
@@ -33,16 +40,18 @@ jobs:
           git remote add upstream https://github.com/termux/termux-app.git || true
           git fetch upstream master
           BEFORE_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse upstream/master)"
           git merge --no-edit --no-ff "upstream/master" -m "sync: merge upstream termux/termux-app master"
-          AFTER_SHA="$(git rev-parse HEAD)"
-          if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+          RELEASE_COMMIT="$(git rev-parse HEAD)"
+          if [ "$BEFORE_SHA" != "$RELEASE_COMMIT" ]; then
             git push origin HEAD:master
             echo "synced=true" >> "$GITHUB_OUTPUT"
           else
             echo "Already up to date with upstream."
             echo "synced=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "upstream_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "release_commit=$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
 
       - name: Apply F-Droid prebuild patches
         shell: bash
@@ -126,7 +135,7 @@ jobs:
             "$UNSIGNED_APK"
           "$BUILD_TOOLS" verify --verbose "$SIGNED_APK"
           VERSION_NAME="$(grep -m1 'versionName "' ./app/build.gradle | sed -E 's/.*versionName "([^"]+)".*/\1/')"
-          RELEASE_TAG="weekly-${VERSION_NAME}-$(date -u +%Y%m%d)-${{ steps.sync.outputs.upstream_sha }}"
+          RELEASE_TAG="weekly-${VERSION_NAME}-$(date -u +%Y%m%d)-${{ steps.sync.outputs.release_commit }}"
           RELEASE_TAG="${RELEASE_TAG:0:120}"
           echo "signed_apk=$SIGNED_APK" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -138,17 +147,72 @@ jobs:
           name: ${{ steps.sign.outputs.release_tag }}
           path: ${{ steps.sign.outputs.signed_apk }}
           if-no-files-found: error
+          retention-days: 14
+
+  docker-release-assets:
+    name: Build Termux Docker release assets
+    uses: ./.github/workflows/build_termux_docker_release_assets.yml
+    with:
+      source_ref: master
+
+  publish-release:
+    name: Publish APK and Docker release
+    needs: [sync-and-build, docker-release-assets]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download signed APK
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.sync-and-build.outputs.release_tag }}
+          path: release-assets
+
+      - name: Download Docker images
+        uses: actions/download-artifact@v7
+        with:
+          pattern: termux-docker-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          find . -maxdepth 1 -type f \
+            \( -name '*.apk' -o -name '*.docker.tar.gz' \) \
+            -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum \
+            | sed 's#  \./#  #' > SHA256SUMS
+          test -s SHA256SUMS
+          echo "Release assets:"
+          ls -lh
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.sign.outputs.release_tag }}
-          name: Termux weekly build ${{ steps.sign.outputs.version_name }}
+          tag_name: ${{ needs.sync-and-build.outputs.release_tag }}
+          target_commitish: ${{ needs.sync-and-build.outputs.release_commit }}
+          name: Termux weekly build ${{ needs.sync-and-build.outputs.version_name }}
           body: |
-            Automated weekly build from [termux/termux-app](https://github.com/termux/termux-app) `master`.
+            Automated weekly build from [termux/termux-app](https://github.com/termux/termux-app) `master` with matching Termux Docker release assets.
 
-            - Upstream commit: `${{ steps.sync.outputs.upstream_sha }}`
-            - Variant: `apt-android-7` universal release
-            - Upstream sync applied: `${{ steps.sync.outputs.synced }}`
-          files: ${{ steps.sign.outputs.signed_apk }}
+            - Upstream Termux app commit: `${{ needs.sync-and-build.outputs.upstream_sha }}`
+            - Fork release commit: `${{ needs.sync-and-build.outputs.release_commit }}`
+            - Variant: `apt-android-7` universal signed release APK
+            - Upstream sync applied: `${{ needs.sync-and-build.outputs.synced }}`
+            - Termux Docker source: [termux/termux-docker](https://github.com/termux/termux-docker) `${{ needs.docker-release-assets.outputs.source_sha }}`
+            - Docker variants: APT and pacman for `i686`, `x86_64`, `arm`, and `aarch64`
+
+            Docker archives are saved images, not Android APK containers. Load one with:
+
+            ```sh
+            gzip -dc termux-docker-apt-aarch64-*.docker.tar.gz | docker load
+            docker run -it --rm termux/termux-docker:aarch64
+            ```
+
+            Pacman archives load `termux/termux-docker-pacman:<architecture>` instead. Docker environments do not contain the Android runtime, so Android-only APIs are unavailable inside the containers.
+          files: release-assets/*
+          fail_on_unmatched_files: true
           prerelease: true
+          make_latest: false
