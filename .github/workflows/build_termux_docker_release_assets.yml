@@ -1,0 +1,201 @@
+name: Build Termux Docker release assets
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: "termux/termux-docker branch, tag, or commit to build"
+        required: false
+        default: master
+        type: string
+    outputs:
+      source_sha:
+        description: "Resolved termux/termux-docker commit"
+        value: ${{ jobs.resolve-source.outputs.source_sha }}
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "termux/termux-docker branch, tag, or commit to build"
+        required: false
+        default: master
+        type: string
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - '.github/workflows/build_termux_docker_release_assets.yml'
+      - '.github/workflows/weekly-upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termux-docker-release-assets-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  resolve-source:
+    name: Resolve termux-docker source
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_short_sha: ${{ steps.source.outputs.source_short_sha }}
+    steps:
+      - id: source
+        name: Resolve immutable source commit
+        env:
+          TERMUX_DOCKER_REF: ${{ inputs.source_ref || 'master' }}
+        run: |
+          set -euo pipefail
+          git init --quiet source
+          git -C source remote add origin https://github.com/termux/termux-docker.git
+          git -C source fetch --quiet --depth=1 origin "$TERMUX_DOCKER_REF"
+          SOURCE_SHA="$(git -C source rev-parse FETCH_HEAD)"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "source_short_sha=${SOURCE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Resolved termux/termux-docker '$TERMUX_DOCKER_REF' to $SOURCE_SHA"
+
+  build-images:
+    name: Docker ${{ matrix.package_manager }} / ${{ matrix.architecture }}
+    needs: resolve-source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: i686
+            package_manager: apt
+            image_name: termux/termux-docker
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            package_manager: apt
+            image_name: termux/termux-docker
+          - runner: ubuntu-24.04-arm
+            architecture: arm
+            package_manager: apt
+            image_name: termux/termux-docker
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            package_manager: apt
+            image_name: termux/termux-docker
+          - runner: ubuntu-24.04
+            architecture: i686
+            package_manager: pacman
+            image_name: termux/termux-docker-pacman
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            package_manager: pacman
+            image_name: termux/termux-docker-pacman
+          - runner: ubuntu-24.04-arm
+            architecture: arm
+            package_manager: pacman
+            image_name: termux/termux-docker-pacman
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            package_manager: pacman
+            image_name: termux/termux-docker-pacman
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout pinned termux-docker source
+        uses: actions/checkout@v6
+        with:
+          repository: termux/termux-docker
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+          path: termux-docker
+          persist-credentials: false
+
+      - name: Build image
+        working-directory: termux-docker
+        env:
+          TERMUX_ARCH: ${{ matrix.architecture }}
+          TERMUX_PACKAGE_MANAGER: ${{ matrix.package_manager }}
+        run: |
+          set -euo pipefail
+          ./generate.sh
+
+      - name: Smoke-test image
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          TERMUX_ARCH: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE_NAME:$TERMUX_ARCH" >/dev/null
+          docker run --rm "$IMAGE_NAME:$TERMUX_ARCH" sh -lc '
+            set -eu
+            test "$PREFIX" = /data/data/com.termux/files/usr
+            command -v bash >/dev/null
+            command -v uname >/dev/null
+            printf "termux-docker-ok "
+            uname -m
+          '
+
+      - name: Export portable Docker image archive
+        id: archive
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          TERMUX_ARCH: ${{ matrix.architecture }}
+          PACKAGE_MANAGER: ${{ matrix.package_manager }}
+          SOURCE_SHORT_SHA: ${{ needs.resolve-source.outputs.source_short_sha }}
+        run: |
+          set -euo pipefail
+          ASSET="termux-docker-${PACKAGE_MANAGER}-${TERMUX_ARCH}-${SOURCE_SHORT_SHA}.docker.tar"
+          docker save --output "$ASSET" "$IMAGE_NAME:$TERMUX_ARCH"
+          gzip -1 "$ASSET"
+          ASSET_GZ="$ASSET.gz"
+          sha256sum "$ASSET_GZ" > "$ASSET_GZ.sha256"
+          echo "termux-docker source: https://github.com/termux/termux-docker/commit/${{ needs.resolve-source.outputs.source_sha }}" > "$ASSET_GZ.source.txt"
+          echo "asset=$ASSET_GZ" >> "$GITHUB_OUTPUT"
+          echo "checksum=$ASSET_GZ.sha256" >> "$GITHUB_OUTPUT"
+          echo "source_metadata=$ASSET_GZ.source.txt" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET_GZ" "$ASSET_GZ.sha256" "$ASSET_GZ.source.txt"
+
+      - name: Upload Docker release asset
+        uses: actions/upload-artifact@v6
+        with:
+          name: termux-docker-${{ matrix.package_manager }}-${{ matrix.architecture }}
+          path: |
+            ${{ steps.archive.outputs.asset }}
+            ${{ steps.archive.outputs.checksum }}
+            ${{ steps.archive.outputs.source_metadata }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  attach-to-published-release:
+    name: Attach Docker assets to published release
+    if: ${{ github.event_name == 'release' }}
+    needs: [resolve-source, build-images]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Docker assets
+        uses: actions/download-artifact@v7
+        with:
+          pattern: termux-docker-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate aggregate Docker checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          find . -maxdepth 1 -type f -name '*.docker.tar.gz' -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum \
+            | sed 's#  \./#  #' > TERMUX-DOCKER-SHA256SUMS
+          test -s TERMUX-DOCKER-SHA256SUMS
+
+      - name: Attach Docker assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          ((${#assets[@]} > 0))
+          gh release upload "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
