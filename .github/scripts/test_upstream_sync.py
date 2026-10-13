@@ -104,6 +104,22 @@ class SyncTests(unittest.TestCase):
         report = self.prepare()
         self.assertFalse(report['synced'])
         self.assertEqual(sync.commit('HEAD'), self.base)
+        self.assertEqual(report['incoming_workflow_changes'], [])
+        self.assertFalse((self.root / 'review/upstream-workflows.patch').exists())
+        self.assertTrue(all(path.stat().st_size > 0 for path in (self.root / 'review').iterdir()))
+
+    def test_app_only_merge_has_nonempty_release_evidence(self):
+        self.git('checkout', 'upstream')
+        self.write('app.txt', 'application-only update\n')
+        self.commit('app update')
+        self.git('checkout', 'master')
+        report = self.prepare()
+        self.assertTrue(report['synced'])
+        self.assertEqual(report['incoming_workflow_changes'], [])
+        self.assertEqual(Path('app.txt').read_text(), 'application-only update\n')
+        files = list((self.root / 'review').iterdir())
+        self.assertEqual([path.name for path in files], ['upstream-sync.json'])
+        self.assertTrue(all(path.stat().st_size > 0 for path in files))
 
     def test_publish_preserves_concurrent_remote_update(self):
         remote = self.root / 'remote.git'

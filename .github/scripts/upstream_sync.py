@@ -41,7 +41,10 @@ def prepare(upstream_ref, report_dir):
     # Keep the complete incoming workflow diff for review; do not apply it with
     # the built-in Actions token, whose permissions exclude workflow updates.
     patch = git('diff', '--binary', base, upstream, '--', WORKFLOWS).stdout
-    (report_dir / 'upstream-workflows.patch').write_text(patch, encoding='utf-8')
+    # GitHub release assets must contain at least one byte. The JSON record
+    # represents the no-change case; do not publish an empty patch asset.
+    if patch:
+        (report_dir / 'upstream-workflows.patch').write_text(patch, encoding='utf-8')
     if git('merge-base', '--is-ancestor', upstream, before, check=False).returncode != 0:
         try:
             merged = git('merge', '--no-commit', '--no-ff', upstream, check=False)
