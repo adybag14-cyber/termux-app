@@ -30,6 +30,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Validate the upstream sync helper
+        run: python3 -B -m unittest discover -s .github/scripts -p test_upstream_sync.py -v
+
       - name: Sync with upstream termux/termux-app master
         id: sync
         shell: bash
@@ -37,21 +40,21 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/termux/termux-app.git || true
-          git fetch upstream master
-          BEFORE_SHA="$(git rev-parse HEAD)"
-          UPSTREAM_SHA="$(git rev-parse upstream/master)"
-          git merge --no-edit --no-ff "upstream/master" -m "sync: merge upstream termux/termux-app master"
-          RELEASE_COMMIT="$(git rev-parse HEAD)"
-          if [ "$BEFORE_SHA" != "$RELEASE_COMMIT" ]; then
-            git push origin HEAD:master
-            echo "synced=true" >> "$GITHUB_OUTPUT"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/termux/termux-app.git
           else
-            echo "Already up to date with upstream."
-            echo "synced=false" >> "$GITHUB_OUTPUT"
+            git remote add upstream https://github.com/termux/termux-app.git
           fi
-          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-          echo "release_commit=$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags upstream master:refs/remotes/upstream/master
+          python3 -B .github/scripts/upstream_sync.py prepare \
+            --report-dir "$RUNNER_TEMP/termux-sync-review"
+
+      - name: Save upstream workflow changes for review
+        uses: actions/upload-artifact@v6
+        with:
+          name: upstream-sync-review
+          path: ${{ runner.temp }}/termux-sync-review/*
+          if-no-files-found: error
 
       - name: Apply F-Droid prebuild patches
         shell: bash
@@ -67,14 +70,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Build universal release APK
+      - name: Run tests and build universal release APK
         shell: bash
         env:
           TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS: '0'
           TERMUX_PACKAGE_VARIANT: apt-android-7
         run: |
           set -euo pipefail
-          ./gradlew :app:downloadBootstraps :app:assembleRelease --no-daemon
+          ./gradlew test :app:downloadBootstraps :app:assembleRelease --no-daemon
 
       - name: Decode signing keystore
         shell: bash
@@ -135,11 +138,18 @@ jobs:
             "$UNSIGNED_APK"
           "$BUILD_TOOLS" verify --verbose "$SIGNED_APK"
           VERSION_NAME="$(grep -m1 'versionName "' ./app/build.gradle | sed -E 's/.*versionName "([^"]+)".*/\1/')"
-          RELEASE_TAG="weekly-${VERSION_NAME}-$(date -u +%Y%m%d)-${{ steps.sync.outputs.release_commit }}"
-          RELEASE_TAG="${RELEASE_TAG:0:120}"
+          RELEASE_TAG="weekly-${VERSION_NAME}-$(date -u +%Y%m%d)-${{ steps.sync.outputs.release_commit }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          if [ "${#RELEASE_TAG}" -gt 120 ]; then
+            echo "Release tag exceeds the supported length; refusing to truncate its unique identity."
+            exit 1
+          fi
           echo "signed_apk=$SIGNED_APK" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Push the tested source merge
+        if: github.ref == 'refs/heads/master'
+        run: python3 -B .github/scripts/upstream_sync.py publish --report "$RUNNER_TEMP/termux-sync-review/upstream-sync.json"
 
       - name: Upload signed APK artifact
         uses: actions/upload-artifact@v6
@@ -157,9 +167,16 @@ jobs:
 
   publish-release:
     name: Publish APK and Docker release
+    if: github.ref == 'refs/heads/master'
     needs: [sync-and-build, docker-release-assets]
     runs-on: ubuntu-24.04
     steps:
+      - name: Download upstream sync review evidence
+        uses: actions/download-artifact@v7
+        with:
+          name: upstream-sync-review
+          path: release-assets
+
       - name: Download signed APK
         uses: actions/download-artifact@v7
         with:
@@ -179,7 +196,7 @@ jobs:
           set -euo pipefail
           cd release-assets
           find . -maxdepth 1 -type f \
-            \( -name '*.apk' -o -name '*.docker.tar.gz' \) \
+            \( -name '*.apk' -o -name '*.docker.tar.gz' -o -name 'upstream-sync.json' -o -name 'upstream-workflows.patch' \) \
             -print0 \
             | sort -z \
             | xargs -0 -r sha256sum \
@@ -201,6 +218,7 @@ jobs:
             - Fork release commit: `${{ needs.sync-and-build.outputs.release_commit }}`
             - Variant: `apt-android-7` universal signed release APK
             - Upstream sync applied: `${{ needs.sync-and-build.outputs.synced }}`
+            - App source is merged from upstream; this fork's workflow definitions are retained. Incoming upstream workflow changes are included in `upstream-workflows.patch` for review, with commit identities in `upstream-sync.json`.
             - Termux Docker source: [termux/termux-docker](https://github.com/termux/termux-docker) `${{ needs.docker-release-assets.outputs.source_sha }}`
             - Docker variants: APT and pacman for `i686`, `x86_64`, `arm`, and `aarch64`
 
