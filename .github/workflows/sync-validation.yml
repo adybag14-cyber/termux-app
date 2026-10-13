@@ -1,0 +1,23 @@
+name: Upstream sync regression tests
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/weekly-upstream-sync-release.yml'
+      - '.github/workflows/sync-validation.yml'
+  push:
+    branches: [master]
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/weekly-upstream-sync-release.yml'
+      - '.github/workflows/sync-validation.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sync-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Exercise source merges, workflow retention and push races
+        run: python3 -B -m unittest discover -s .github/scripts -p test_upstream_sync.py -v
