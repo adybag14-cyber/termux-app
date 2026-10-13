@@ -195,6 +195,11 @@ jobs:
         run: |
           set -euo pipefail
           cd release-assets
+          EMPTY_ASSET="$(find . -maxdepth 1 -type f -empty -print -quit)"
+          if [ -n "$EMPTY_ASSET" ]; then
+            echo "Empty release asset: $EMPTY_ASSET"
+            exit 1
+          fi
           find . -maxdepth 1 -type f \
             \( -name '*.apk' -o -name '*.docker.tar.gz' -o -name 'upstream-sync.json' -o -name 'upstream-workflows.patch' \) \
             -print0 \
@@ -218,7 +223,7 @@ jobs:
             - Fork release commit: `${{ needs.sync-and-build.outputs.release_commit }}`
             - Variant: `apt-android-7` universal signed release APK
             - Upstream sync applied: `${{ needs.sync-and-build.outputs.synced }}`
-            - App source is merged from upstream; this fork's workflow definitions are retained. Incoming upstream workflow changes are included in `upstream-workflows.patch` for review, with commit identities in `upstream-sync.json`.
+            - App source is merged from upstream; this fork's workflow definitions are retained. Commit identities and incoming workflow changes are recorded in `upstream-sync.json`; `upstream-workflows.patch` is included when there are changes to review.
             - Termux Docker source: [termux/termux-docker](https://github.com/termux/termux-docker) `${{ needs.docker-release-assets.outputs.source_sha }}`
             - Docker variants: APT and pacman for `i686`, `x86_64`, `arm`, and `aarch64`
 
